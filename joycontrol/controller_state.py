@@ -198,8 +198,6 @@ async def button_press(controller_state, *buttons):
     :param controller_state:
     :param buttons: Buttons to press down (see ButtonState.get_available_buttons)
     """
-    if not buttons:
-        raise ValueError('No Buttons were given.')
 
     button_state = controller_state.button_state
 
@@ -210,6 +208,10 @@ async def button_press(controller_state, *buttons):
     # wait until report is send
     await controller_state.send()
 
+async def button_clear(controller_state):
+    button_state = controller_state.button_state
+    button_state.clear()
+    await controller_state.send()
 
 async def button_release(controller_state, *buttons):
     """
@@ -217,8 +219,6 @@ async def button_release(controller_state, *buttons):
     :param controller_state:
     :param buttons: Buttons to set to unpressed (see ButtonState.get_available_buttons)
     """
-    if not buttons:
-        raise ValueError('No Buttons were given.')
 
     button_state = controller_state.button_state
 

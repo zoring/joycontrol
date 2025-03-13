@@ -4,14 +4,18 @@ import argparse
 import asyncio
 import logging
 import os
-
+import queue
+import threading
+import select
+import sys
+import re
 from aioconsole import ainput
 
 import joycontrol.debug as debug
 from joycontrol import logging_default as log, utils
 from joycontrol.command_line_interface import ControllerCLI
 from joycontrol.controller import Controller
-from joycontrol.controller_state import ControllerState, button_push, button_press, button_release
+from joycontrol.controller_state import ControllerState, button_push, button_press, button_release, button_clear
 from joycontrol.memory import FlashMemory
 from joycontrol.protocol import controller_protocol_factory
 from joycontrol.server import create_hid_server
@@ -55,6 +59,196 @@ Options:
                                             connection.
 """
 
+char_to_key = {
+    "A": 'a',
+    "B": 'b',
+    "X": 'x',
+    "Y": 'y',
+    "a": 'a',
+    "b": 'b',
+    "x": 'x',
+    "y": 'y',
+    "+": 'plus',
+    "-": 'minus',
+    "r": 'r',
+    "l": 'l',
+    "zl":'zl',
+    "zr": 'zr'
+}
+
+
+def l_up(controller_state):
+    stick = controller_state.l_stick_state
+    stick.set_up()
+
+def l_down(controller_state):
+    stick = controller_state.l_stick_state
+    stick.set_down()
+
+def l_left(controller_state):
+    stick = controller_state.l_stick_state
+    stick.set_left()
+
+def l_right(controller_state):
+    stick = controller_state.l_stick_state
+    stick.set_right()
+
+def r_up(controller_state):
+    stick = controller_state.r_stick_state
+    stick.set_up()
+
+def r_down(controller_state):
+    stick = controller_state.r_stick_state
+    stick.set_down()
+
+def r_left(controller_state):
+    stick = controller_state.r_stick_state
+    stick.set_left()
+
+def r_right(controller_state):
+    stick = controller_state.r_stick_state
+    stick.set_right()
+
+def extract_duration(text, default=0.3):
+    """
+    提取并限制时间参数
+    :param text: 输入文本
+    :param default: 未找到时间时的默认值
+    :return: 处理后的时间值（0.3~10）
+    """
+    # 正则匹配所有数字+秒的组合（支持整数和小数）
+    matches = re.findall(r'(\d+\.?\d*)\s*秒', text)
+    
+    if not matches:
+        return default
+    
+    try:
+        # 取最后一个时间参数（更符合自然语言习惯）
+        duration = float(matches[-1])
+    except ValueError:
+        return default
+    
+    # 应用限制规则
+    return min(max(duration, 0.3), 10)
+
+def process_sentence(sentence, controller_state):
+    # 增强版匹配规则（支持同义词组）
+    isFound = False
+    look_rules = {
+        '左': {
+            'patterns': [r'左看', r'看左', r'向左看', r'看左边'], 
+            'func': r_left,
+            'exclude': ['左']
+        },
+        '右': {
+            'patterns': [r'右看', r'看右', r'向右看', r'看右边'],
+            'func': r_right,
+            'exclude': ['右']
+        },
+        '上': {
+            'patterns': [r'上看', r'看上', r'向上看', r'看上方'],
+            'func': r_up,
+            'exclude': ['上']
+        },
+        '下': {
+            'patterns': [r'下看', r'看下', r'向下看', r'看下面'],
+            'func': r_down,
+            'exclude': ['下']
+        }
+    }
+
+    # 方向词映射
+    direction_map = {
+        '左': l_left,
+        '右': l_right,
+        '上': l_up,
+        '下': l_down
+    }
+
+    triggered = set()
+    found_directions = set()
+
+    # 第一阶段：检测复合动作
+    for direction, rule in look_rules.items():
+        for pattern in rule['patterns']:
+            if re.search(pattern, sentence):
+                rule['func'](controller_state)
+                isFound = True
+                triggered.update(rule['exclude'])
+                found_directions.add(direction)
+                break  # 找到任意一个即触发
+
+    # 第二阶段：检测基础方向词（带排除机制）
+    for char, func in direction_map.items():
+        # 检查是否包含方向字且未被排除
+        if char in sentence and char not in triggered:
+            # 排除已找到复合动作的情况
+            if char not in found_directions:
+                # 进一步验证是独立方向词（避免类似"左右"的情况）
+                pattern = rf'(?:^|[\s，。！？]){char}(?=\d*秒?)|(?:^|[\s，。！？]){char}(?:$|[\s，。！？])'
+                if re.search(pattern, sentence):
+                    func(controller_state)
+                    isFound = True
+                    break  # 每个方向只触发一次
+    return isFound
+
+
+def receiverPipeAndSend(pipe_name, data_queue):
+    print("hello ")
+    try:
+        pipe_fd = os.open(pipe_name, os.O_RDONLY | os.O_NONBLOCK)
+        pipe = os.fdopen(pipe_fd)
+
+        while True:
+            ready, _, _ = select.select([pipe], [], [], 2.0)
+            if pipe in ready:
+                data = pipe.readline().strip()
+                if data:
+                    print(f"read pipe: {data}")
+                    data_queue.put(data)
+    except Exception as e:
+        print(f"Error reading from pipe: {e}")
+    finally:
+        if pipe:
+            pipe.close()
+            print("close pipe")
+        print("final block executed")
+    print("end of pipe reading")
+
+
+async def revice_from_pip(controller_state, data_queue):
+    if controller_state.get_controller() != Controller.PRO_CONTROLLER:
+        raise ValueError('This script only works with the Pro Controller!')
+
+    # waits until controller is fully connected
+    await controller_state.connect()
+    await ainput(prompt='Make sure the Switch is in the Home menu and press <enter> to continue.')
+    while True:
+        if data_queue.empty():
+            await asyncio.sleep(0.5)
+        while not data_queue.empty():
+            data = data_queue.get()
+            if data:
+                isFound = process_sentence(data, controller_state)
+                needSecond =  extract_duration(data)
+                input_str = []
+                isButton = False
+                for char in data:
+                    if char in char_to_key:
+                        input_str.append(char_to_key[char])
+                        isButton = True
+                if isFound or isButton:
+                    
+                    print(f"秒{needSecond} {input_str}")
+                    await button_push(controller_state, *input_str, sec=needSecond)
+                    if isFound:
+                        controller_state.l_stick_state.set_center()
+                        controller_state.r_stick_state.set_center()
+                        await button_clear(controller_state)
+                    
+
+
+
 
 async def test_controller_buttons(controller_state: ControllerState):
     """
@@ -66,18 +260,24 @@ async def test_controller_buttons(controller_state: ControllerState):
 
     # waits until controller is fully connected
     await controller_state.connect()
-
+#await ainput(prompt='Make sure the Switch is in the Home menu and press <enter> to continue.')
+    """
     await ainput(prompt='Make sure the Switch is in the Home menu and press <enter> to continue.')
 
-    """
     # We assume we are in the "Change Grip/Order" menu of the switch
-    await button_push(controller_state, 'home')
 
     # wait for the animation
     await asyncio.sleep(1)
     """
 
+    """
+    await button_push(controller_state, 'home', sec=1)
+    await asyncio.sleep(1)
+    """
     # Goto settings
+    await asyncio.sleep(1)
+    await button_push(controller_state, 'a')
+    await asyncio.sleep(1)
     await button_push(controller_state, 'down', sec=1)
     await button_push(controller_state, 'right', sec=2)
     await asyncio.sleep(0.3)
@@ -117,7 +317,14 @@ async def test_controller_buttons(controller_state: ControllerState):
         button_list.remove('capture')
     if 'home' in button_list:
         button_list.remove('home')
-
+    """
+    button_list.remove('a')
+# button_list.remove('b')
+    button_list.remove('x')
+    button_list.remove('y')
+    button_list.remove('plus')
+    button_list.remove('minus')
+    """
     user_input = asyncio.ensure_future(
         ainput(prompt='Pressing all buttons... Press <enter> to stop.')
     )
@@ -126,8 +333,22 @@ async def test_controller_buttons(controller_state: ControllerState):
     while not user_input.done():
         for button in button_list:
             await button_push(controller_state, button)
-            await asyncio.sleep(0.1)
+            """
+            stick = controller_state.l_stick_state
+            # 将左摇杆向上推
+            stick.set_h(128)  # 水平位置保持在中心
+            stick.set_v(0)    # 垂直位置推到最上端
 
+            # 将左摇杆向右推
+            stick.set_h(255)  # 水平位置推到最右端
+            stick.set_v(128)  # 垂直位置保持在中心
+
+            # 将左摇杆归位到中心
+            stick.set_h(128)
+            stick.set_v(128)
+            """
+            await asyncio.sleep(0.1)
+            print(f"button {button} \n")
             if user_input.done():
                 break
 
@@ -295,6 +516,13 @@ async def _main(args):
     # Get controller name to emulate from arguments
     controller = Controller.from_arg(args.controller)
 
+    data_queue = queue.Queue()
+    pipe_name = "/tmp/go_python_pipe"
+
+    pipe_thread = threading.Thread(target=receiverPipeAndSend, args=(pipe_name, data_queue))
+    pipe_thread.daemon = True
+    pipe_thread.start()
+
     # parse the spi flash
     if args.spi_flash:
         with open(args.spi_flash, 'rb') as spi_flash_file:
@@ -326,7 +554,9 @@ async def _main(args):
         if args.nfc is not None:
             await cli.commands['nfc'](args.nfc)
 
+#await test_controller_buttons(controller_state)
         # run the cli
+        await revice_from_pip(controller_state, data_queue)
         try:
             await cli.run()
         finally:

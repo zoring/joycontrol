@@ -118,8 +118,8 @@ class ControllerProtocol(BaseProtocol):
         if self._is_pairing and (int.from_bytes(input_report.data[4:7], "big") & close_pairing_masks[self.controller]):
             # this is a bit too early, but so far no
             logger.info('left change Grip/Order menu')
-            self._is_pairing = False
-            self._set_mode(self._input_report_mode)
+#self._is_pairing = False
+#self._set_mode(self._input_report_mode)
 
         if not self._not_paused.is_set():
             logger.warning("Write while paused")
@@ -170,8 +170,15 @@ class ControllerProtocol(BaseProtocol):
             last_send_time = time.time()
             input_report = self._generate_input_report()
             try:
+                if self.transport is None:
+                    logger.error("Transport is None, cannot send input report")
+                    break
                 await self._write(input_report)
-            except:
+            except AttributeError as e:
+                logger.error(f"AttributeError in _write: {e}, {input_report}")
+                break
+            except Exception as e:
+                logger.error(f"Error in _write: {e}")
                 break
             # calculate delay
             self.send_delay = debug.get_delay(self.send_delay) #debug hook
@@ -185,6 +192,7 @@ class ControllerProtocol(BaseProtocol):
                 await asyncio.wait_for(self._input_report_wakeup.wait(), timeout=sleep_time)
                 self._input_report_wakeup.clear()
             except asyncio.TimeoutError as err:
+                #logger.debug("Timeout occurred")
                 pass
 
         logger.warning("Writer exited...")
