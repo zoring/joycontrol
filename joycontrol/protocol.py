@@ -124,11 +124,13 @@ class ControllerProtocol(BaseProtocol):
         if not self._not_paused.is_set():
             logger.warning("Write while paused")
 
+        #logger.info("?????? ouyang")
         await self.transport.write(input_report)
-
+# print("?????? ouyang end")
         self._controller_state.sig_is_send.set()
 
     def _generate_input_report(self, mode=None):
+#print("????????????")
         input_report = InputReport()
         if not mode:
             mode = self._input_report_mode
@@ -319,13 +321,18 @@ class ControllerProtocol(BaseProtocol):
             raise NotConnectedError('Transport not registered.')
 
         if not self._not_paused.is_set():
+            print("????????///////////////////////////////////////////////osend_controller_stateuyang 444")
             await self._write(self._generate_input_report())
+            print("ouyang 44444442")
         else:
             self._controller_state.sig_is_send.clear()
 
+            print("ouyang begin   555")
             # wrap into a future to be able to set an exception in case of a disconnect
             self._controller_state_sender = asyncio.ensure_future(self._controller_state.sig_is_send.wait())
-            await self._controller_state_sender
+            print("ouyang 555")
+#await self._controller_state_sender
+            print("ouyang 5555*****")
             self._controller_state_sender = None
 
     async def wait_for_output_report(self):

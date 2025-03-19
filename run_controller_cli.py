@@ -9,6 +9,10 @@ import threading
 import select
 import sys
 import re
+import json
+import websockets
+from urllib.parse import urlunparse
+from typing import Dict, Any, Optional
 from aioconsole import ainput
 
 import joycontrol.debug as debug
@@ -73,9 +77,16 @@ char_to_key = {
     "r": 'r',
     "l": 'l',
     "zl":'zl',
-    "zr": 'zr'
+    "zr": 'zr',
+    "UP": "up",
+    "DOWN": "down",
+    "LEFT": "left",
+    "RIGHT": "right"
 }
 
+controller_state_update = None
+# 声明一个全局的队列
+message_queue = asyncio.Queue()
 
 def l_up(controller_state):
     stick = controller_state.l_stick_state
@@ -109,7 +120,7 @@ def r_right(controller_state):
     stick = controller_state.r_stick_state
     stick.set_right()
 
-def extract_duration(text, default=0.3):
+def extract_duration(text, default=0.8):
     """
     提取并限制时间参数
     :param text: 输入文本
@@ -185,7 +196,7 @@ def process_sentence(sentence, controller_state):
             # 排除已找到复合动作的情况
             if char not in found_directions:
                 # 进一步验证是独立方向词（避免类似"左右"的情况）
-                pattern = rf'(?:^|[\s，。！？]){char}(?=\d*秒?)|(?:^|[\s，。！？]){char}(?:$|[\s，。！？])'
+                pattern = rf'(?<!看|望){char}(?!看|望)'
                 if re.search(pattern, sentence):
                     func(controller_state)
                     isFound = True
@@ -217,15 +228,18 @@ def receiverPipeAndSend(pipe_name, data_queue):
 
 
 async def revice_from_pip(controller_state, data_queue):
+    global controller_state_update
     if controller_state.get_controller() != Controller.PRO_CONTROLLER:
         raise ValueError('This script only works with the Pro Controller!')
 
     # waits until controller is fully connected
     await controller_state.connect()
     await ainput(prompt='Make sure the Switch is in the Home menu and press <enter> to continue.')
+    
+    controller_state_update = controller_state
     while True:
         if data_queue.empty():
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
         while not data_queue.empty():
             data = data_queue.get()
             if data:
@@ -512,6 +526,164 @@ def _register_commands_with_controller_state(controller_state, cli):
 
     cli.add_command(unpause.__name__, unpause)
 
+
+
+class StateUpdate:
+    def __init__(self):
+        self.type: str = ""
+        self.state: Dict[str, Any] = {
+            "buttons": {},
+            "joysticks": {
+                "left_joystick": {"X": 0, "Y": 0},
+                "right_joystick": {"X": 0, "Y": 0}
+            }
+        }
+        self.timestamp: int = 0
+
+def parse_state_update(message: str) -> Optional[StateUpdate]:
+    """
+    解析 WebSocket 消息为 StateUpdate 对象
+    """
+    try:
+        data = json.loads(message)
+        update = StateUpdate()
+        update.type = data.get("type", "")
+        update.state["buttons"] = data.get("state", {}).get("buttons", {})
+        joysticks = data.get("state", {}).get("joysticks", {})
+        
+        # 检查左摇杆数据
+        left_joystick = joysticks.get("left_joystick", {})
+        update.state["joysticks"]["left_joystick"]["X"] = left_joystick.get("x", 0)
+        update.state["joysticks"]["left_joystick"]["Y"] = left_joystick.get("y", 0)
+        
+        # 检查右摇杆数据
+        right_joystick = joysticks.get("right_joystick", {})
+        update.state["joysticks"]["right_joystick"]["X"] = right_joystick.get("x", 0)
+        update.state["joysticks"]["right_joystick"]["Y"] = right_joystick.get("y", 0)
+        
+        update.timestamp = data.get("timestamp", 0)
+        return update
+    except json.JSONDecodeError:
+        logging.info("Raw message: %s", message)
+        return None
+    except Exception as e:
+        logging.error("Parse error: %s", e)
+        return None
+
+
+async def websocket_message_producer():
+    # 构造 WebSocket URL
+    url_components = {
+        "scheme": "ws",
+        "netloc": "8.138.108.55:3389",
+        "path": "/client",
+        "params": "",
+        "query": "",
+        "fragment": ""
+    }
+    url = urlunparse(url_components.values())
+    # 连接到 WebSocket 服务器
+    max_retries = 5  # 最大重试次数
+    retry_delay = 1  # 重试间隔（秒）
+    while True:
+        try:
+            async with websockets.connect(url) as websocket_conn:
+                logging.info("Connected as Client B")
+
+                while True:
+                    try:
+                        # 读取消息
+                        message = await websocket_conn.recv()
+                        logger.info("message, %s", message)
+                        # 将消息放入队列
+                        await message_queue.put(message)
+                    except websockets.ConnectionClosed as e:
+                        logging.error("Connection closed: %s", e)
+                        break
+                    except Exception as e:
+                        logging.error("Read error: %s", e)
+                        break
+        except Exception as e:
+            logging.error("Connect failed: %s", e)
+        
+        # 断线重连逻辑
+        logging.info("Disconnected, retrying connection...")
+        retry_delay = min(retry_delay * 2, 30)  # 指数退避算法
+        await asyncio.sleep(retry_delay)
+
+async def websocket_message_consumer():
+    global controller_state_update
+    while True:
+        try:
+            # 从队列中获取消息
+            message = await message_queue.get()
+            if message is None:
+                break  # 如果收到None，退出循环
+
+            # 解析消息
+            update = parse_state_update(message)
+#           logging.info("ooooo ??????? {controller_state_update} %s -%s ", update, controller_state_update)
+            if update and controller_state_update:
+                # 打印解析后的数据
+                logging.info(
+                    "[%d] BTN: %s | L:(%d,%d) R:(%d,%d)",
+                    update.timestamp,
+                    update.state["buttons"],
+                    update.state["joysticks"]["left_joystick"]["X"],
+                    update.state["joysticks"]["left_joystick"]["Y"],
+                    update.state["joysticks"]["right_joystick"]["X"],
+                    update.state["joysticks"]["right_joystick"]["Y"]
+                )
+                isUpdate = False
+#if  update.state["joysticks"]["right_joystick"]["Y"] != 2048 or update.state["joysticks"]["right_joystick"]["X"] != 2048:
+                controller_state_update.r_stick_state.set_v(update.state["joysticks"]["right_joystick"]["Y"])
+                controller_state_update.r_stick_state.set_h(update.state["joysticks"]["right_joystick"]["X"])
+                isUpdate = True
+#if update.state["joysticks"]["left_joystick"]["Y"] != 2048 or update.state["joysticks"]["left_joystick"]["X"] != 2048:
+                controller_state_update.l_stick_state.set_v(update.state["joysticks"]["left_joystick"]["Y"])
+                controller_state_update.l_stick_state.set_h(update.state["joysticks"]["left_joystick"]["X"])
+                isUpdate = True
+                input_str = []
+                for button, value in update.state["buttons"].items():
+                    if button in char_to_key and value:
+                        logging.info("LLLL ")
+                        input_str.append(char_to_key[button])
+                        isUpdate = True
+                if isUpdate:
+                    await button_push(controller_state_update, *input_str)
+                logging.info("??? enndnnn ?? %s", input_str)
+                # 任务完成，释放队列中的项
+                message_queue.task_done()
+        except Exception as e:
+            logging.error("Consumer error: %s", e)
+
+# 启动两个协程
+async def webSocketThrad():
+    producer = asyncio.create_task(websocket_message_producer())
+    consumer = asyncio.create_task(websocket_message_consumer())
+    await asyncio.gather(producer, consumer)
+
+def start_websocket_thread():
+    # 创建一个新事件循环并设置为当前线程的事件循环
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        loop.run_until_complete(webSocketThrad())
+    finally:
+        loop.close()
+
+    '''
+    # 创建一个新事件循环并设置为当前线程的事件循环
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(run_websocket_client())
+    finally:
+        loop.close()
+    '''
+
 async def _main(args):
     # Get controller name to emulate from arguments
     controller = Controller.from_arg(args.controller)
@@ -522,6 +694,8 @@ async def _main(args):
     pipe_thread = threading.Thread(target=receiverPipeAndSend, args=(pipe_name, data_queue))
     pipe_thread.daemon = True
     pipe_thread.start()
+    websocket_thread = threading.Thread(target=start_websocket_thread, daemon=True)
+    websocket_thread.start()    
 
     # parse the spi flash
     if args.spi_flash:
